@@ -20,6 +20,7 @@ import {
   InvalidStatusTransitionError,
 } from "@/lib/admin/logic";
 import { placeOrder, getOrdersForUser } from "@/lib/orders/logic";
+import { fulfillOrder } from "@/lib/stripe/fulfillment";
 import type { ShippingAddress } from "@/lib/validations/checkout";
 
 const prisma = getTestClient();
@@ -197,8 +198,8 @@ describe("adminUpdateOrderStatus", () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 5 });
     const user = await seedUserWithCart(variant.id);
     const order = await placeOrder(prisma, user.id, ADDRESS);
-    // placeOrder now creates orders as PAID
-    expect(order.status).toBe("PAID");
+    // Phase 6: placeOrder creates PENDING; fulfillOrder advances to PAID
+    await fulfillOrder(prisma, order.id, "evt_admin_transition_001");
 
     const updated = await adminUpdateOrderStatus(prisma, "ADMIN", order.id, "PROCESSING");
     expect(updated.status).toBe("PROCESSING");
@@ -208,6 +209,8 @@ describe("adminUpdateOrderStatus", () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 5 });
     const user = await seedUserWithCart(variant.id);
     const order = await placeOrder(prisma, user.id, ADDRESS);
+    // Phase 6: must reach PAID via fulfillOrder before admin transitions
+    await fulfillOrder(prisma, order.id, "evt_admin_transition_002");
 
     // Walk to DELIVERED via valid transitions
     await adminUpdateOrderStatus(prisma, "ADMIN", order.id, "PROCESSING");
@@ -223,6 +226,7 @@ describe("adminUpdateOrderStatus", () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 5 });
     const user = await seedUserWithCart(variant.id);
     const order = await placeOrder(prisma, user.id, ADDRESS);
+    await fulfillOrder(prisma, order.id, "evt_admin_transition_003");
 
     await adminUpdateOrderStatus(prisma, "ADMIN", order.id, "CANCELLED");
     await expect(
@@ -236,11 +240,11 @@ describe("adminUpdateOrderStatus", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("placeOrder default status", () => {
-  it("newly created order defaults to PAID (v1 synchronous mock payment)", async () => {
+  it("newly created order defaults to PENDING (awaiting Stripe payment confirmation)", async () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 5 });
     const user = await seedUserWithCart(variant.id);
     const order = await placeOrder(prisma, user.id, ADDRESS);
-    expect(order.status).toBe("PAID");
+    expect(order.status).toBe("PENDING");
   });
 });
 

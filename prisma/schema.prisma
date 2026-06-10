@@ -133,6 +133,11 @@ model OrderItem {
   color       String
 }
 
+model ProcessedEvent {
+  id          String   @id // Stripe event ID (evt_...)
+  processedAt DateTime @default(now())
+}
+
 enum Role {
   USER
   ADMIN

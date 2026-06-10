@@ -14,6 +14,6 @@ export function getTestClient(): PrismaClient {
 export async function cleanDb(prisma: PrismaClient) {
   // Delete in reverse FK order; RESTART IDENTITY resets sequences
   await prisma.$executeRawUnsafe(
-    `TRUNCATE TABLE "CartItem", "OrderItem", "Order", "Address", "ProductVariant", "Product", "Category", "User" RESTART IDENTITY CASCADE`
+    `TRUNCATE TABLE "CartItem", "OrderItem", "Order", "Address", "ProductVariant", "Product", "Category", "User", "ProcessedEvent" RESTART IDENTITY CASCADE`
   );
 }

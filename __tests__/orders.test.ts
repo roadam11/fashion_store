@@ -9,6 +9,7 @@ import {
   EmptyCartError,
   InactiveVariantError,
 } from "@/lib/orders/logic";
+import { fulfillOrder } from "@/lib/stripe/fulfillment";
 import type { ShippingAddress } from "@/lib/validations/checkout";
 
 const prisma = getTestClient();
@@ -31,10 +32,14 @@ async function seedUserWithCart(variantId: string, qty: number) {
   return user;
 }
 
-// ─── Canary: stock=1, two concurrent placeOrder calls ────────────────────────
+// ─── Canary: stock contention resolved at fulfillOrder (Phase 6) ─────────────
+//
+// placeOrder creates PENDING orders without touching stock.
+// fulfillOrder is where the stock race happens — the same conditional
+// updateMany WHERE stock >= qty pattern enforces the overselling invariant.
 
-describe("placeOrder — concurrency / overselling prevention", () => {
-  it("stock=1, two concurrent calls → exactly one succeeds, one throws OutOfStockError, stock=0 never negative", async () => {
+describe("fulfillOrder — concurrency / overselling prevention", () => {
+  it("stock=1, two concurrent fulfills → exactly one succeeds, one throws OutOfStockError, stock=0", async () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 1 });
 
     const [userA, userB] = await Promise.all([
@@ -42,9 +47,16 @@ describe("placeOrder — concurrency / overselling prevention", () => {
       seedUserWithCart(variant.id, 1),
     ]);
 
-    const results = await Promise.allSettled([
+    // Both placeOrder succeed (no stock check in placeOrder phase 6)
+    const [orderA, orderB] = await Promise.all([
       placeOrder(prisma, userA.id, ADDRESS),
       placeOrder(prisma, userB.id, ADDRESS),
+    ]);
+
+    // Race on fulfillOrder — only one can decrement stock=1
+    const results = await Promise.allSettled([
+      fulfillOrder(prisma, orderA.id, "evt_concurrent_A"),
+      fulfillOrder(prisma, orderB.id, "evt_concurrent_B"),
     ]);
 
     const succeeded = results.filter((r) => r.status === "fulfilled");
@@ -58,7 +70,7 @@ describe("placeOrder — concurrency / overselling prevention", () => {
     expect(after!.stock).toBe(0);
   });
 
-  it("N=10 concurrent orders on stock=M=5 → exactly 5 succeed, 5 fail, stock=0", async () => {
+  it("N=10 concurrent fulfills on stock=M=5 → exactly 5 succeed, 5 fail, stock=0", async () => {
     const N = 10;
     const M = 5;
     const { variant } = await createVariantWithProduct(prisma, { stock: M });
@@ -67,8 +79,14 @@ describe("placeOrder — concurrency / overselling prevention", () => {
       Array.from({ length: N }, () => seedUserWithCart(variant.id, 1))
     );
 
-    const results = await Promise.allSettled(
+    // All placeOrder succeed (PENDING, no stock decrement)
+    const orders = await Promise.all(
       users.map((u) => placeOrder(prisma, u.id, ADDRESS))
+    );
+
+    // Concurrent fulfillOrder — M will win the stock race, N-M will fail
+    const results = await Promise.allSettled(
+      orders.map((o, i) => fulfillOrder(prisma, o.id, `evt_n10_${i}`))
     );
 
     const succeeded = results.filter((r) => r.status === "fulfilled");
@@ -171,7 +189,7 @@ describe("placeOrder — snapshots", () => {
 
 // ─── Transaction rollback ─────────────────────────────────────────────────────
 
-describe("placeOrder — transaction rollback", () => {
+describe("fulfillOrder — transaction rollback", () => {
   it("first variant stock restored when second variant is out of stock", async () => {
     const { variant: v1 } = await createVariantWithProduct(prisma, { stock: 5 });
     const { variant: v2 } = await createVariantWithProduct(prisma, { stock: 0 }); // will fail
@@ -184,13 +202,19 @@ describe("placeOrder — transaction rollback", () => {
       ],
     });
 
-    await expect(placeOrder(prisma, user.id, ADDRESS)).rejects.toThrow(OutOfStockError);
+    // placeOrder succeeds (PENDING, no stock check)
+    const order = await placeOrder(prisma, user.id, ADDRESS);
+
+    // fulfillOrder fails because v2 has stock=0 — transaction rolls back
+    await expect(
+      fulfillOrder(prisma, order.id, "evt_rollback_001")
+    ).rejects.toThrow(OutOfStockError);
 
     // v1 stock must be fully restored (transaction rolled back)
     const after1 = await prisma.productVariant.findUnique({ where: { id: v1.id } });
     expect(after1!.stock).toBe(5);
 
-    // Cart must also be untouched (no partial order committed)
+    // Cart must also be untouched (fulfillOrder tx rolled back)
     const cartItems = await prisma.cartItem.findMany({ where: { userId: user.id } });
     expect(cartItems).toHaveLength(2);
   });
@@ -215,11 +239,12 @@ describe("order ownership", () => {
     expect(result).toBeNull();
   });
 
-  it("cart is cleared after successful order", async () => {
+  it("cart is cleared after fulfillment (payment confirmed)", async () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 10 });
     const user = await seedUserWithCart(variant.id, 2);
 
-    await placeOrder(prisma, user.id, ADDRESS);
+    const order = await placeOrder(prisma, user.id, ADDRESS);
+    await fulfillOrder(prisma, order.id, "evt_cart_clear_ownership");
 
     const cartItems = await prisma.cartItem.findMany({ where: { userId: user.id } });
     expect(cartItems).toHaveLength(0);

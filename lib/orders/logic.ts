@@ -101,50 +101,33 @@ export async function placeOrder(
     0
   );
 
-  // ── 4. Single atomic transaction ──────────────────────────────────────────
+  // ── 4. Create PENDING order (no stock decrement yet) ─────────────────────
   //
-  // READ COMMITTED isolation (Postgres default) is sufficient:
-  // the conditional updateMany acquires a row-level lock on the variant row,
-  // so a concurrent transaction sees the committed decrement and count===0.
-  return prisma.$transaction(async (tx) => {
-    // 4a. Atomic stock decrement — the anti-overselling invariant
-    for (const line of lines) {
-      const res = await tx.productVariant.updateMany({
-        where: { id: line.variantId, stock: { gte: line.quantity } },
-        data: { stock: { decrement: line.quantity } },
-      });
-      if (res.count === 0) throw new OutOfStockError(line.variantId);
-    }
-
-    // 4b. Create order with flat shipping snapshot
-    const order = await tx.order.create({
-      data: {
-        userId,
-        totalAmount,
-        status: "PAID", // v1: synchronous mock payment — order is already paid on creation
-        shippingStreet: address.street,
-        shippingCity: address.city,
-        shippingZipCode: address.zipCode,
-        shippingCountry: address.country,
-        shippingPhone: address.phone,
-        items: {
-          create: lines.map((l) => ({
-            variantId: l.variantId,
-            quantity: l.quantity,
-            priceAtTime: l.priceAtTime,
-            productName: l.productName,
-            variantSku: l.variantSku,
-            size: l.size,
-            color: l.color,
-          })),
-        },
+  // Stock decrement and cart clear happen in the Stripe webhook handler
+  // (fulfillOrder) after payment is confirmed. This prevents overselling
+  // while keeping the order as a record of intent during the payment flow.
+  return prisma.order.create({
+    data: {
+      userId,
+      totalAmount,
+      status: "PENDING",
+      shippingStreet: address.street,
+      shippingCity: address.city,
+      shippingZipCode: address.zipCode,
+      shippingCountry: address.country,
+      shippingPhone: address.phone,
+      items: {
+        create: lines.map((l) => ({
+          variantId: l.variantId,
+          quantity: l.quantity,
+          priceAtTime: l.priceAtTime,
+          productName: l.productName,
+          variantSku: l.variantSku,
+          size: l.size,
+          color: l.color,
+        })),
       },
-      include: { items: true },
-    });
-
-    // 4c. Clear cart in same transaction — atomicity with the order creation
-    await tx.cartItem.deleteMany({ where: { userId } });
-
-    return order;
+    },
+    include: { items: true },
   });
 }
