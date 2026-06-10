@@ -5,7 +5,6 @@ import {
   placeOrder,
   getOrdersForUser,
   getOrderById,
-  OutOfStockError,
   EmptyCartError,
   InactiveVariantError,
 } from "@/lib/orders/logic";
@@ -39,7 +38,12 @@ async function seedUserWithCart(variantId: string, qty: number) {
 // updateMany WHERE stock >= qty pattern enforces the overselling invariant.
 
 describe("fulfillOrder — concurrency / overselling prevention", () => {
-  it("stock=1, two concurrent fulfills → exactly one succeeds, one throws OutOfStockError, stock=0", async () => {
+  // fulfillOrder NEVER throws OutOfStockError — it catches it and marks
+  // the order NEEDS_ATTENTION so the webhook always returns 200.
+  // The invariant is: stock never goes below 0, M orders become PAID,
+  // the rest become NEEDS_ATTENTION.
+
+  it("stock=1, two concurrent fulfills → one PAID, one NEEDS_ATTENTION, stock=0", async () => {
     const { variant } = await createVariantWithProduct(prisma, { stock: 1 });
 
     const [userA, userB] = await Promise.all([
@@ -47,30 +51,30 @@ describe("fulfillOrder — concurrency / overselling prevention", () => {
       seedUserWithCart(variant.id, 1),
     ]);
 
-    // Both placeOrder succeed (no stock check in placeOrder phase 6)
     const [orderA, orderB] = await Promise.all([
       placeOrder(prisma, userA.id, ADDRESS),
       placeOrder(prisma, userB.id, ADDRESS),
     ]);
 
-    // Race on fulfillOrder — only one can decrement stock=1
-    const results = await Promise.allSettled([
+    // Both resolve — no throw; loser is marked NEEDS_ATTENTION
+    await Promise.all([
       fulfillOrder(prisma, orderA.id, "evt_concurrent_A"),
       fulfillOrder(prisma, orderB.id, "evt_concurrent_B"),
     ]);
 
-    const succeeded = results.filter((r) => r.status === "fulfilled");
-    const failed = results.filter((r) => r.status === "rejected");
+    const [finalA, finalB] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: orderA.id } }),
+      prisma.order.findUniqueOrThrow({ where: { id: orderB.id } }),
+    ]);
 
-    expect(succeeded).toHaveLength(1);
-    expect(failed).toHaveLength(1);
-    expect((failed[0] as PromiseRejectedResult).reason).toBeInstanceOf(OutOfStockError);
+    const statuses = [finalA.status, finalB.status].sort();
+    expect(statuses).toEqual(["NEEDS_ATTENTION", "PAID"]);
 
     const after = await prisma.productVariant.findUnique({ where: { id: variant.id } });
     expect(after!.stock).toBe(0);
   });
 
-  it("N=10 concurrent fulfills on stock=M=5 → exactly 5 succeed, 5 fail, stock=0", async () => {
+  it("N=10 concurrent fulfills on stock=M=5 → exactly 5 PAID, 5 NEEDS_ATTENTION, stock=0", async () => {
     const N = 10;
     const M = 5;
     const { variant } = await createVariantWithProduct(prisma, { stock: M });
@@ -79,24 +83,24 @@ describe("fulfillOrder — concurrency / overselling prevention", () => {
       Array.from({ length: N }, () => seedUserWithCart(variant.id, 1))
     );
 
-    // All placeOrder succeed (PENDING, no stock decrement)
     const orders = await Promise.all(
       users.map((u) => placeOrder(prisma, u.id, ADDRESS))
     );
 
-    // Concurrent fulfillOrder — M will win the stock race, N-M will fail
-    const results = await Promise.allSettled(
+    // All resolve — no throws
+    await Promise.all(
       orders.map((o, i) => fulfillOrder(prisma, o.id, `evt_n10_${i}`))
     );
 
-    const succeeded = results.filter((r) => r.status === "fulfilled");
-    const failed = results.filter((r) => r.status === "rejected");
+    const finalOrders = await Promise.all(
+      orders.map((o) => prisma.order.findUniqueOrThrow({ where: { id: o.id } }))
+    );
 
-    expect(succeeded).toHaveLength(M);
-    expect(failed).toHaveLength(N - M);
-    failed.forEach((r) => {
-      expect((r as PromiseRejectedResult).reason).toBeInstanceOf(OutOfStockError);
-    });
+    const paid = finalOrders.filter((o) => o.status === "PAID");
+    const needsAttention = finalOrders.filter((o) => o.status === "NEEDS_ATTENTION");
+
+    expect(paid).toHaveLength(M);
+    expect(needsAttention).toHaveLength(N - M);
 
     const after = await prisma.productVariant.findUnique({ where: { id: variant.id } });
     expect(after!.stock).toBe(0);
@@ -189,8 +193,8 @@ describe("placeOrder — snapshots", () => {
 
 // ─── Transaction rollback ─────────────────────────────────────────────────────
 
-describe("fulfillOrder — transaction rollback", () => {
-  it("first variant stock restored when second variant is out of stock", async () => {
+describe("fulfillOrder — transaction rollback + NEEDS_ATTENTION", () => {
+  it("v1 stock restored when v2 is out of stock; order marked NEEDS_ATTENTION; cart untouched", async () => {
     const { variant: v1 } = await createVariantWithProduct(prisma, { stock: 5 });
     const { variant: v2 } = await createVariantWithProduct(prisma, { stock: 0 }); // will fail
 
@@ -202,19 +206,19 @@ describe("fulfillOrder — transaction rollback", () => {
       ],
     });
 
-    // placeOrder succeeds (PENDING, no stock check)
     const order = await placeOrder(prisma, user.id, ADDRESS);
 
-    // fulfillOrder fails because v2 has stock=0 — transaction rolls back
-    await expect(
-      fulfillOrder(prisma, order.id, "evt_rollback_001")
-    ).rejects.toThrow(OutOfStockError);
+    // fulfillOrder resolves (does not throw) — caught internally, marks NEEDS_ATTENTION
+    await fulfillOrder(prisma, order.id, "evt_rollback_001");
 
-    // v1 stock must be fully restored (transaction rolled back)
+    const finalOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(finalOrder.status).toBe("NEEDS_ATTENTION");
+
+    // v1 stock fully restored — main transaction rolled back before v2 failed
     const after1 = await prisma.productVariant.findUnique({ where: { id: v1.id } });
     expect(after1!.stock).toBe(5);
 
-    // Cart must also be untouched (fulfillOrder tx rolled back)
+    // Cart untouched — main transaction rolled back before cart clear
     const cartItems = await prisma.cartItem.findMany({ where: { userId: user.id } });
     expect(cartItems).toHaveLength(2);
   });

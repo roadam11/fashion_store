@@ -17,48 +17,68 @@ export function verifyWebhookSignature(
 // ─── Fulfillment ──────────────────────────────────────────────────────────────
 //
 // Called from the webhook handler after signature verification.
-// Idempotent: if stripeEventId already exists in ProcessedEvent, returns early.
-// Atomic: all writes (stock decrement, status update, cart clear) are in one
-// transaction. If any step fails (e.g. out of stock), nothing is committed and
-// the webhook handler returns 500 so Stripe will retry.
+//
+// Happy path (stock available):
+//   Single atomic transaction: idempotency check → stock decrement →
+//   order → PAID → cart clear → ProcessedEvent insert.
+//   Same event ID delivered twice = no-op (dedup via ProcessedEvent).
+//
+// Sad path (stock exhausted after customer paid):
+//   Main transaction throws OutOfStockError and rolls back (no partial decrement).
+//   A second transaction marks the order NEEDS_ATTENTION and writes ProcessedEvent
+//   so Stripe retries see the dedup record and get 200 — no infinite retry loop.
+//   Admin must resolve manually (issue refund in Stripe dashboard → update to REFUNDED).
+//
+// Any other error re-throws → webhook returns 500 → Stripe retries (transient fault).
 
 export async function fulfillOrder(
   prisma: PrismaClient,
   orderId: string,
   stripeEventId: string
 ): Promise<void> {
-  await prisma.$transaction(async (tx) => {
-    // Idempotency check — upsert will fail silently if already processed
-    const existing = await tx.processedEvent.findUnique({
-      where: { id: stripeEventId },
-    });
-    if (existing) return; // already fulfilled — safe to re-ack to Stripe
-
-    // Lock the order row and fetch items
-    const order = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      include: { items: true },
-    });
-
-    // Atomic stock decrement — the anti-overselling invariant
-    for (const item of order.items) {
-      const res = await tx.productVariant.updateMany({
-        where: { id: item.variantId, stock: { gte: item.quantity } },
-        data: { stock: { decrement: item.quantity } },
+  try {
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.processedEvent.findUnique({
+        where: { id: stripeEventId },
       });
-      if (res.count === 0) throw new OutOfStockError(item.variantId);
-    }
+      if (existing) return;
 
-    // Advance order status to PAID
-    await tx.order.update({
-      where: { id: orderId },
-      data: { status: "PAID" },
+      const order = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: { items: true },
+      });
+
+      // Atomic stock decrement — anti-overselling invariant
+      for (const item of order.items) {
+        const res = await tx.productVariant.updateMany({
+          where: { id: item.variantId, stock: { gte: item.quantity } },
+          data: { stock: { decrement: item.quantity } },
+        });
+        if (res.count === 0) throw new OutOfStockError(item.variantId);
+      }
+
+      await tx.order.update({ where: { id: orderId }, data: { status: "PAID" } });
+      await tx.cartItem.deleteMany({ where: { userId: order.userId } });
+      await tx.processedEvent.create({ data: { id: stripeEventId } });
     });
-
-    // Clear the user's cart (order now owns the intent)
-    await tx.cartItem.deleteMany({ where: { userId: order.userId } });
-
-    // Record this event as processed — prevents double-fulfillment on retry
-    await tx.processedEvent.create({ data: { id: stripeEventId } });
-  });
+  } catch (err) {
+    if (err instanceof OutOfStockError) {
+      // Customer was charged but stock is exhausted — no rollback-safe refund here.
+      // Mark for admin attention; commit ProcessedEvent so Stripe stops retrying.
+      await prisma.$transaction(async (tx) => {
+        // Re-check: a concurrent delivery may have already handled this
+        const alreadyHandled = await tx.processedEvent.findUnique({
+          where: { id: stripeEventId },
+        });
+        if (alreadyHandled) return;
+        await tx.order.update({
+          where: { id: orderId },
+          data: { status: "NEEDS_ATTENTION" },
+        });
+        await tx.processedEvent.create({ data: { id: stripeEventId } });
+      });
+      return; // don't rethrow — webhook returns 200, Stripe stops retrying
+    }
+    throw err; // transient fault → webhook returns 500 → Stripe retries
+  }
 }

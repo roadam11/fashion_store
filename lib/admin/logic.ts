@@ -32,13 +32,14 @@ function requireAdmin(role: string): void {
 // ─── Status transition map ────────────────────────────────────────────────────
 
 const ALLOWED_TRANSITIONS: Record<string, OrderStatus[]> = {
-  PENDING:    ["PAID", "CANCELLED"],
-  PAID:       ["PROCESSING", "CANCELLED", "REFUNDED"],
-  PROCESSING: ["SHIPPED", "CANCELLED"],
-  SHIPPED:    ["DELIVERED"],
-  DELIVERED:  [],
-  CANCELLED:  [],
-  REFUNDED:   [],
+  PENDING:         ["PAID", "CANCELLED"],
+  PAID:            ["PROCESSING", "CANCELLED", "REFUNDED"],
+  PROCESSING:      ["SHIPPED", "CANCELLED"],
+  SHIPPED:         ["DELIVERED"],
+  DELIVERED:       [],
+  CANCELLED:       [],
+  REFUNDED:        [],
+  NEEDS_ATTENTION: ["REFUNDED"], // admin resolves: issue Stripe refund → mark REFUNDED
 };
 
 // ─── Slug helper ──────────────────────────────────────────────────────────────

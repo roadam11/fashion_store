@@ -151,4 +151,5 @@ enum OrderStatus {
   DELIVERED
   CANCELLED
   REFUNDED
+  NEEDS_ATTENTION  // paid by customer but stock exhausted at fulfillment time
 }
