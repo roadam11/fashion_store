@@ -121,7 +121,7 @@ export async function placeOrder(
       data: {
         userId,
         totalAmount,
-        status: "PENDING",
+        status: "PAID", // v1: synchronous mock payment — order is already paid on creation
         shippingStreet: address.street,
         shippingCity: address.city,
         shippingZipCode: address.zipCode,
