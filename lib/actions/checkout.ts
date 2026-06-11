@@ -4,11 +4,15 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { getStripe } from "@/lib/stripe/client";
 import { placeOrder } from "@/lib/orders/logic";
+import { fulfillOrder } from "@/lib/stripe/fulfillment";
 import { shippingAddressSchema, type ShippingAddress } from "@/lib/validations/checkout";
 import {
   getAddressForUser,
   saveAddressForUser,
 } from "@/lib/checkout/logic";
+
+const BASE_URL = process.env.NEXTAUTH_URL ?? "http://localhost:3000";
+const MOCK_PAYMENTS = process.env.MOCK_PAYMENTS === "true";
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -18,7 +22,18 @@ async function requireAuth() {
   return session.user.id;
 }
 
+// Mock path: skip Stripe entirely, fulfill immediately, redirect to success page
+async function buildAndFulfillLocally(userId: string, address: ShippingAddress) {
+  const order = await placeOrder(prisma, userId, address);
+  // Use a synthetic event ID so the ProcessedEvent dedup table stays consistent
+  const mockEventId = `mock_${order.id}`;
+  await fulfillOrder(prisma, order.id, mockEventId);
+  return { url: `${BASE_URL}/checkout/success?order=${order.id}` };
+}
+
 async function buildAndRedirectToStripe(userId: string, address: ShippingAddress) {
+  if (MOCK_PAYMENTS) return buildAndFulfillLocally(userId, address);
+
   const stripe = getStripe();
   const order = await placeOrder(prisma, userId, address);
 
@@ -36,8 +51,8 @@ async function buildAndRedirectToStripe(userId: string, address: ShippingAddress
     payment_method_types: ["card"],
     line_items: lineItems,
     metadata: { orderId: order.id },
-    success_url: `${process.env.NEXTAUTH_URL}/checkout/success?order=${order.id}`,
-    cancel_url: `${process.env.NEXTAUTH_URL}/checkout/cancel`,
+    success_url: `${BASE_URL}/checkout/success?order=${order.id}`,
+    cancel_url: `${BASE_URL}/checkout/cancel`,
   });
 
   await prisma.order.update({
