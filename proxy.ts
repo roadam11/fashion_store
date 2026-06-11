@@ -1,20 +1,32 @@
-import { auth } from "@/lib/auth";
+import NextAuth from "next-auth";
+import { authConfig } from "@/lib/auth.config";
 import { NextResponse } from "next/server";
+
+// Edge-safe: uses authConfig which has no Prisma/Node.js imports.
+// Full auth (credentials + signIn callback) stays in lib/auth.ts (Node.js runtime).
+const { auth } = NextAuth(authConfig);
 
 export default auth((req) => {
   const session = req.auth;
   const { pathname } = req.nextUrl;
   const res = NextResponse.next();
 
-  // UX-only guards (authz is re-validated in every server action / route handler)
+  // UX-only guards — authz is re-validated in every server action / route handler
   if (pathname.startsWith("/admin") && session?.user?.role !== "ADMIN") {
     return NextResponse.redirect(new URL("/auth/login", req.url));
   }
+  // /checkout/success and /checkout/cancel are Stripe return pages — public
+  const isCheckoutCallback =
+    pathname === "/checkout/success" || pathname === "/checkout/cancel";
+
   if (
-    (pathname.startsWith("/account") || pathname.startsWith("/checkout")) &&
+    (pathname.startsWith("/account") ||
+      (pathname.startsWith("/checkout") && !isCheckoutCallback)) &&
     !session?.user
   ) {
-    return NextResponse.redirect(new URL(`/auth/login?callbackUrl=${pathname}`, req.url));
+    return NextResponse.redirect(
+      new URL(`/auth/login?callbackUrl=${pathname}`, req.url)
+    );
   }
 
   // Set httpOnly sessionId cookie for guests so cart items can be stored
@@ -28,7 +40,7 @@ export default auth((req) => {
     });
   }
 
-  // Clear guest cookie once user is authenticated (merge already happened in signIn callback)
+  // Clear guest cookie once user is authenticated
   if (session?.user && req.cookies.get("sessionId")) {
     res.cookies.delete("sessionId");
   }

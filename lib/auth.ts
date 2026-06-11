@@ -5,6 +5,7 @@ import { cookies } from "next/headers";
 import { prisma } from "@/lib/db";
 import { mergeGuestCart } from "@/lib/cart/logic";
 import { z } from "zod";
+import { authConfig } from "@/lib/auth.config";
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -12,7 +13,7 @@ const loginSchema = z.object({
 });
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  session: { strategy: "jwt" },
+  ...authConfig,
   providers: [
     Credentials({
       async authorize(credentials) {
@@ -32,6 +33,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     }),
   ],
   callbacks: {
+    ...authConfig.callbacks,
     async signIn({ user }) {
       if (user.id) {
         try {
@@ -47,20 +49,5 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       }
       return true;
     },
-    jwt({ token, user }) {
-      if (user) {
-        token.id = user.id!;
-        token.role = (user as { role: string }).role;
-      }
-      return token;
-    },
-    session({ session, token }) {
-      session.user.id = token.id as string;
-      session.user.role = token.role as string;
-      return session;
-    },
-  },
-  pages: {
-    signIn: "/auth/login",
   },
 });

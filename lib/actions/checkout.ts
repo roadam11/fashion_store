@@ -4,24 +4,29 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { getStripe } from "@/lib/stripe/client";
 import { placeOrder } from "@/lib/orders/logic";
-import type { ShippingAddress } from "@/lib/validations/checkout";
+import { shippingAddressSchema, type ShippingAddress } from "@/lib/validations/checkout";
+import {
+  getAddressForUser,
+  saveAddressForUser,
+} from "@/lib/checkout/logic";
 
-export async function createCheckoutSessionAction(address: ShippingAddress) {
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+async function requireAuth() {
   const session = await auth();
   if (!session?.user?.id) throw new Error("Not authenticated");
+  return session.user.id;
+}
 
-  const userId = session.user.id;
+async function buildAndRedirectToStripe(userId: string, address: ShippingAddress) {
   const stripe = getStripe();
-
-  // Create PENDING order — no stock decrement yet
   const order = await placeOrder(prisma, userId, address);
 
-  // Build line items from the order's snapshot (server-authoritative prices)
   const lineItems = order.items.map((item) => ({
     price_data: {
       currency: "ils",
       product_data: { name: `${item.productName} (${item.size} / ${item.color})` },
-      unit_amount: item.priceAtTime, // already in agorot (= Stripe's smallest unit for ILS)
+      unit_amount: item.priceAtTime, // agorot — Stripe's smallest ILS unit
     },
     quantity: item.quantity,
   }));
@@ -31,15 +36,41 @@ export async function createCheckoutSessionAction(address: ShippingAddress) {
     payment_method_types: ["card"],
     line_items: lineItems,
     metadata: { orderId: order.id },
-    success_url: `${process.env.NEXTAUTH_URL}/account?order=${order.id}&status=success`,
-    cancel_url: `${process.env.NEXTAUTH_URL}/checkout?cancelled=true`,
+    success_url: `${process.env.NEXTAUTH_URL}/checkout/success?order=${order.id}`,
+    cancel_url: `${process.env.NEXTAUTH_URL}/checkout/cancel`,
   });
 
-  // Persist the Stripe session ID so the webhook can look up the order
   await prisma.order.update({
     where: { id: order.id },
     data: { stripeSessionId: checkoutSession.id },
   });
 
   return { url: checkoutSession.url! };
+}
+
+// ─── Public actions ───────────────────────────────────────────────────────────
+
+export async function createCheckoutSessionAction(address: ShippingAddress) {
+  const userId = await requireAuth();
+  const validated = shippingAddressSchema.parse(address);
+  return buildAndRedirectToStripe(userId, validated);
+}
+
+export async function createCheckoutFromSavedAddressAction(addressId: string) {
+  const userId = await requireAuth();
+  // IDOR guard: throws AddressNotFoundError if address doesn't belong to this user
+  const saved = await getAddressForUser(prisma, userId, addressId);
+  const address: ShippingAddress = {
+    street: saved.street,
+    city: saved.city,
+    zipCode: saved.zipCode,
+    country: saved.country,
+    phone: saved.phone,
+  };
+  return buildAndRedirectToStripe(userId, address);
+}
+
+export async function saveAddressAction(data: ShippingAddress) {
+  const userId = await requireAuth();
+  return saveAddressForUser(prisma, userId, data);
 }
