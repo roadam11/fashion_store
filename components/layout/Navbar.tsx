@@ -1,9 +1,36 @@
 import Link from "next/link";
 import { auth } from "@/lib/auth";
-import { ShoppingBag, User, Menu } from "lucide-react";
+import { cookies } from "next/headers";
+import { prisma } from "@/lib/db";
+import { ShoppingBag, User } from "lucide-react";
+
+async function getCartCount() {
+  try {
+    const session = await auth();
+    if (session?.user?.id) {
+      const res = await prisma.cartItem.aggregate({
+        where: { userId: session.user.id },
+        _sum: { quantity: true },
+      });
+      return res._sum.quantity ?? 0;
+    }
+    const cookieStore = await cookies();
+    const sessionId = cookieStore.get("sessionId")?.value;
+    if (sessionId) {
+      const res = await prisma.cartItem.aggregate({
+        where: { sessionId },
+        _sum: { quantity: true },
+      });
+      return res._sum.quantity ?? 0;
+    }
+  } catch {
+    // never crash the navbar
+  }
+  return 0;
+}
 
 export default async function Navbar() {
-  const session = await auth();
+  const [session, cartCount] = await Promise.all([auth(), getCartCount()]);
 
   return (
     <header className="sticky top-0 z-50 bg-white border-b border-gray-200">
@@ -47,6 +74,11 @@ export default async function Navbar() {
             )}
             <Link href="/cart" className="relative text-gray-600 hover:text-gray-900">
               <ShoppingBag className="h-5 w-5" />
+              {cartCount > 0 && (
+                <span className="absolute -top-2 -left-2 min-w-[18px] h-[18px] bg-gray-900 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">
+                  {cartCount > 99 ? "99+" : cartCount}
+                </span>
+              )}
             </Link>
           </div>
         </div>
